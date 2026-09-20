@@ -1,5 +1,7 @@
 # Detoxification Alignment Pipeline
 
+Итоговая модель выложена на Hugging Face Hub: [r1char9/t5gemma2-detox-ru](https://huggingface.co/r1char9/t5gemma2-detox-ru) .
+
 Проект по детоксификации текста на русском и английском языках с использованием
 двухэтапного alignment-пайплайна: **SFT** (Supervised Fine-Tuning) → **DPO/ORPO**
 (preference-based дообучение на синтетических парах предпочтений).
@@ -77,9 +79,17 @@ SFT-модель дообучается на синтетических пара
 ```bash
 mlflow server --host 0.0.0.0 --port 1234
 ```
+
 ```bash
 python run_sft.py
 ```
 
+```bash
+CUDA_VISIBLE_DEVICES=3,0 torchrun \
+    --nproc_per_node=2 \
+    dpo_training.py
+```
+
+
 Параметры обучения (модель, batch size, learning rate, планировщик и т.д.)
-задаются в `sft_model.py` и `dpo_model.py`.
+задаются в `sft_model_training.py` и `dpo_model_training.py`.

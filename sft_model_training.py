@@ -5,67 +5,16 @@ import mlflow
 import numpy as np
 import torch
 import transformers
-from tqdm import tqdm
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, DataCollatorForSeq2Seq
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+from datasets import concatenate_datasets, load_dataset
 from sentence_transformers import SentenceTransformer
 from torch.utils.data import DataLoader
-from datasets import load_dataset, concatenate_datasets
+from tqdm import tqdm
+from transformers import DataCollatorForSeq2Seq
 
+from config import ALLOWED_KEYS, LANG_PROMPTS, TENSOR_KEYS
 from metrics import compute_metrics
-from utils import mkdir
-from config import ALLOWED_KEYS, TENSOR_KEYS, LANG_PROMPTS
+from utils import initialize_model, initialize_optimizer, initialize_scheduler, save_model
 
-
-
-def initialize_model(args):
-    target_suffixes = ("q_proj", "k_proj", "v_proj", "o_proj")
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        args.model_id,
-        dtype=torch.bfloat16
-    )
-
-    for param in model.parameters():
-        param.requires_grad = False
-
-    unfrozen_count = 0
-    for name, module in model.named_modules():
-        if (
-            isinstance(module, torch.nn.Linear)
-            and "vision_tower" not in name
-            and any(name.endswith(suffix) for suffix in target_suffixes)
-        ):
-            for param in module.parameters():
-                param.requires_grad = True
-                unfrozen_count += param.numel()
-
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-
-    print(f"{trainable_params:,}  parameters out of {total_params:,} ")
-    return model.to(args.device), tokenizer
-
-
-def save_model(checkpoint_dir, model, best):
-    mkdir(checkpoint_dir)
-    model_path = os.path.join(checkpoint_dir, f"model_{'best' if best else 'latest'}.pt")
-    torch.save({
-        'model_state_dict': model.state_dict(),
-    }, model_path)
-    return model_path
-
-
-def load_model_from_checkpoint(args, model_path):
-    model, tokenizer = initialize_model(args)
-    if not os.path.exists(model_path):
-        return model, tokenizer
-
-    checkpoint = torch.load(model_path, map_location=args.device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-
-    return model, tokenizer
 
 
 
@@ -136,68 +85,6 @@ def eval_epoch(model, tokenizer, sim, test_loader, epoch=0):
     return eval_loss, mean_sim
 
 
-def get_parameter_names(model, forbidden_layer_types):
-    result = []
-    for name, child in model.named_children():
-        result += [
-            f"{name}.{n}"
-            for n in get_parameter_names(child, forbidden_layer_types)
-            if not isinstance(child, tuple(forbidden_layer_types))
-        ]
-    result += list(model._parameters.keys())
-    return result
-
-
-def initialize_optimizer(args, model):
-    decay_parameters = get_parameter_names(model, ALL_LAYERNORM_LAYERS)
-    decay_parameters = [name for name in decay_parameters if "bias" not in name]
-    optimizer_grouped_parameters = [
-        {
-            "params": [
-                p for n, p in model.named_parameters() if (n in decay_parameters and p.requires_grad)
-            ],
-            "weight_decay": args.weight_decay,
-        },
-        {
-            "params": [
-                p for n, p in model.named_parameters() if (n not in decay_parameters and p.requires_grad)
-            ],
-            "weight_decay": 0.0,
-        },
-    ]
-
-    if args.optimizer_type == "AdamW":
-        optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters, lr=args.learning_rate, eps=1e-8, betas=(0.9, 0.999)
-        )
-    elif args.optimizer_type == "Adam":
-        optimizer = torch.optim.Adam(
-            optimizer_grouped_parameters, lr=args.learning_rate, eps=1e-8, betas=(0.9, 0.999)
-        )
-    elif args.optimizer_type == "SGD":
-        optimizer = torch.optim.SGD(
-            optimizer_grouped_parameters, lr=args.learning_rate, momentum=0.9
-        )
-    else:
-        raise ValueError(f"misisng: {args.optimizer_type}")
-
-    return optimizer
-
-
-def initialize_scheduler(args, optimizer, epoch_length):
-    num_training_steps = epoch_length * args.max_n_epochs
-    num_warmup_steps = epoch_length * args.num_warmup_epochs
-
-    if args.scheduler_type == "none":
-        return None
-    elif args.scheduler_type == "cosine":
-        return transformers.get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
-    elif args.scheduler_type == "linear":
-        return transformers.get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
-    else:
-        raise NotImplementedError
-
-
 def initialize_optimizer_and_scheduler(args, model, epoch_length):
     optimizer = initialize_optimizer(args, model)
     scheduler = initialize_scheduler(args, optimizer, epoch_length)
@@ -257,24 +144,6 @@ def train(args, model, tokenizer, sim, train_loader, test_loader, optimizer, sch
         print(f"🔗 View in UI: mlflow ui")
 
 
-
-
-args = SimpleNamespace(
-    model_id="google/t5gemma-2-1b-1b",
-    batch_size=16,
-    checkpoint_dir='checkpoints',
-    address="http://0.0.0.0:1234",
-    experiment_name="sft_t5gemma2_detox_ru_v1",
-    weight_decay=0.05,
-    optimizer_type='AdamW',
-    scheduler_type='cosine',
-    max_n_epochs=10,
-    num_warmup_epochs=1,
-    patience_epochs=4,
-    learning_rate=5e-5,
-    device='cuda',
-)
-
 def train_collate_fn(features):
     filtered = [
         {k: v for k, v in f.items() if k in ALLOWED_KEYS}
@@ -305,6 +174,7 @@ def train_preprocess_function(examples):
 
     return {**inputs, 'labels': labels.input_ids}
 
+
 def test_preprocess_function(examples):
     toxic = [LANG_PROMPTS[lang] + tox for lang, tox in zip(examples['lang'], examples['toxic_comment'])]
     inputs = tokenizer(toxic, truncation=True, max_length=512, add_special_tokens=True)
@@ -315,8 +185,23 @@ def test_preprocess_function(examples):
     return {**inputs, 'labels': labels.input_ids, 'detox_comment': toxic, 'neutral_comment': targets}
 
 
-
 def main():
+    args = SimpleNamespace(
+        model_id="google/t5gemma-2-1b-1b",
+        batch_size=16,
+        checkpoint_dir='checkpoints',
+        address="http://0.0.0.0:1234",
+        experiment_name="sft_t5gemma2_detox_ru_v1",
+        weight_decay=0.05,
+        optimizer_type='AdamW',
+        scheduler_type='cosine',
+        max_n_epochs=10,
+        num_warmup_epochs=1,
+        patience_epochs=4,
+        learning_rate=5e-5,
+        device='cuda',
+    )
+
     model, tokenizer = initialize_model(args)
     sim = SentenceTransformer('sentence-transformers/LaBSE')
 
