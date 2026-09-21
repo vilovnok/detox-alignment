@@ -144,47 +144,56 @@ def train(args, model, tokenizer, sim, train_loader, test_loader, optimizer, sch
         print(f"🔗 View in UI: mlflow ui")
 
 
-def train_collate_fn(features):
-    filtered = [
-        {k: v for k, v in f.items() if k in ALLOWED_KEYS}
-        for f in features
-    ]
-    return base_collator(filtered)
-
-def test_collate_fn(features):
-    tensor_features = [
-        {k: v for k, v in f.items() if k in TENSOR_KEYS}
-        for f in features
-    ]
-    batch = base_collator(tensor_features)
-
-    text_keys = set(features[0].keys()) - TENSOR_KEYS
-    for key in text_keys:
-        batch[key] = [f[key] for f in features]
-
-    return batch
-
-
-def train_preprocess_function(examples):
-    toxic = [LANG_PROMPTS[lang] + tox for lang, tox in zip(examples['lang'], examples['toxic_comment'])]
-    inputs = tokenizer(toxic, truncation=True, max_length=512, add_special_tokens=True)
-
-    targets = [t + tokenizer.eos_token for t in examples['neutral_comment']]
-    labels = tokenizer(targets, truncation=True, max_length=512, add_special_tokens=False)
-
-    return {**inputs, 'labels': labels.input_ids}
-
-
-def test_preprocess_function(examples):
-    toxic = [LANG_PROMPTS[lang] + tox for lang, tox in zip(examples['lang'], examples['toxic_comment'])]
-    inputs = tokenizer(toxic, truncation=True, max_length=512, add_special_tokens=True)
-
-    targets = [t + tokenizer.eos_token for t in examples['neutral_comment']]
-    labels = tokenizer(targets, truncation=True, max_length=512, add_special_tokens=False)
-
-    return {**inputs, 'labels': labels.input_ids, 'detox_comment': toxic, 'neutral_comment': targets}
-
-
+def make_collate_fns(base_collator):
+    """Фабрика: коллаторам нужен base_collator, а DataLoader вызывает их без аргументов."""
+ 
+    def train_collate_fn(features):
+        filtered = [
+            {k: v for k, v in f.items() if k in ALLOWED_KEYS}
+            for f in features
+        ]
+        return base_collator(filtered)
+ 
+    def test_collate_fn(features):
+        tensor_features = [
+            {k: v for k, v in f.items() if k in TENSOR_KEYS}
+            for f in features
+        ]
+        batch = base_collator(tensor_features)
+ 
+        text_keys = set(features[0].keys()) - TENSOR_KEYS
+        for key in text_keys:
+            batch[key] = [f[key] for f in features]
+ 
+        return batch
+ 
+    return train_collate_fn, test_collate_fn
+ 
+ 
+def make_preprocess_fns(tokenizer):
+    """Фабрика: препроцессингу нужен tokenizer, а datasets.map() передаёт только examples."""
+ 
+    def train_preprocess_function(examples):
+        toxic = [LANG_PROMPTS[lang] + tox for lang, tox in zip(examples['lang'], examples['toxic_comment'])]
+        inputs = tokenizer(toxic, truncation=True, max_length=512, add_special_tokens=True)
+ 
+        targets = [t + tokenizer.eos_token for t in examples['neutral_comment']]
+        labels = tokenizer(targets, truncation=True, max_length=512, add_special_tokens=False)
+ 
+        return {**inputs, 'labels': labels.input_ids}
+ 
+    def test_preprocess_function(examples):
+        toxic = [LANG_PROMPTS[lang] + tox for lang, tox in zip(examples['lang'], examples['toxic_comment'])]
+        inputs = tokenizer(toxic, truncation=True, max_length=512, add_special_tokens=True)
+ 
+        targets = [t + tokenizer.eos_token for t in examples['neutral_comment']]
+        labels = tokenizer(targets, truncation=True, max_length=512, add_special_tokens=False)
+ 
+        return {**inputs, 'labels': labels.input_ids, 'detox_comment': toxic, 'neutral_comment': targets}
+ 
+    return train_preprocess_function, test_preprocess_function
+ 
+ 
 def main():
     args = SimpleNamespace(
         model_id="google/t5gemma-2-1b-1b",
@@ -201,16 +210,18 @@ def main():
         learning_rate=5e-5,
         device='cuda',
     )
-
+ 
     model, tokenizer = initialize_model(args)
     sim = SentenceTransformer('sentence-transformers/LaBSE')
-
+ 
     base_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         model=args.model_id,
         padding=True,
     )
-
+    train_collate_fn, test_collate_fn = make_collate_fns(base_collator)
+    train_preprocess_function, test_preprocess_function = make_preprocess_fns(tokenizer)
+ 
     train_dataset = load_dataset("r1char9/toxic-detox-pairs", split='train')
     test_dataset = load_dataset("r1char9/toxic-detox-pairs", split='test')
  
@@ -223,26 +234,23 @@ def main():
     train_dataset = concatenate_datasets([train_dataset, test_dataset_to_train])
     test_dataset = test_dataset_small
  
-    train_preprocess_function = train_preprocess_function(tokenizer)
-    test_preprocess_function = test_preprocess_function(tokenizer)
- 
     train_tokenized_dataset = train_dataset.map(
         train_preprocess_function, batched=True, remove_columns=train_dataset.column_names
     )
     test_tokenized_dataset = test_dataset.map(
         test_preprocess_function, batched=True, remove_columns=test_dataset.column_names
     )
-
+ 
     train_loader = DataLoader(
         train_tokenized_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=train_collate_fn
     )
     test_loader = DataLoader(
         test_tokenized_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=test_collate_fn
     )
-
+ 
     optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
     train(args, model, tokenizer, sim, train_loader, test_loader, optimizer, scheduler)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
